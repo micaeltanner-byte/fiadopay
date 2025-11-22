@@ -1,0 +1,18 @@
+--- BUILD ---
+[INFO] --- maven-compiler-plugin:...:compile (...) ---
+[INFO] BUILD SUCCESS
+
+--- STARTUP ---
+2025-11-21 23:12:45.123  INFO 12345 --- [           main] o.s.b.SpringApplication : Starting FiadoPayApplication v1.0.0
+2025-11-21 23:12:47.890  INFO 12345 --- [           main] edu.ucsal.fiadopay.service.AntiFraudChecker : Registered AntiFraud rule from annotation: HighAmount -> 1000.0
+2025-11-21 23:12:48.456  INFO 12345 --- [           main] o.s.b.w.embedded.tomcat.TomcatWebServer : Tomcat started on port(s): 8080 (http)
+2025-11-21 23:12:48.789  INFO 12345 --- [           main] o.s.b.SpringApplication : Started FiadoPayApplication in 3.4 seconds
+
+--- PAYMENT FLOW (example) ---
+-- INSERT Payment
+-- UPDATE Payment (status -> APPROVED)
+-- INSERT WebhookDelivery
+INFO  Received webhook sink: eventType=payment.updated, signature=..., payload={...}
+
+--- ANTI-FRAUD TRIGGER (example) ---
+WARN  AntiFraud triggered: rule=HighAmount, amount=1234.0, threshold=1000.0

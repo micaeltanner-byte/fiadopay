@@ -20,6 +20,8 @@ fiadopay:
   webhook-secret: ucsal-2025
   processing-delay-ms: 1500
   failure-rate: 0.15
+  antifraud:
+    threshold: 1000.0
 
 springdoc:
   api-docs:

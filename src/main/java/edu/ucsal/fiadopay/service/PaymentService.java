@@ -1,20 +1,5 @@
 package edu.ucsal.fiadopay.service;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import edu.ucsal.fiadopay.controller.PaymentRequest;
-import edu.ucsal.fiadopay.controller.PaymentResponse;
-import edu.ucsal.fiadopay.domain.Merchant;
-import edu.ucsal.fiadopay.domain.Payment;
-import edu.ucsal.fiadopay.domain.WebhookDelivery;
-import edu.ucsal.fiadopay.repo.MerchantRepository;
-import edu.ucsal.fiadopay.repo.PaymentRepository;
-import edu.ucsal.fiadopay.repo.WebhookDeliveryRepository;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpStatus;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.server.ResponseStatusException;
-
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.net.URI;
@@ -25,7 +10,27 @@ import java.time.Instant;
 import java.util.Base64;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.server.ResponseStatusException;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import edu.ucsal.fiadopay.annotations.AntiFraud;
+import edu.ucsal.fiadopay.controller.PaymentRequest;
+import edu.ucsal.fiadopay.controller.PaymentResponse;
+import edu.ucsal.fiadopay.domain.Merchant;
+import edu.ucsal.fiadopay.domain.Payment;
+import edu.ucsal.fiadopay.domain.WebhookDelivery;
+import edu.ucsal.fiadopay.repo.MerchantRepository;
+import edu.ucsal.fiadopay.repo.PaymentRepository;
+import edu.ucsal.fiadopay.repo.WebhookDeliveryRepository;
 
 @Service
 public class PaymentService {
@@ -33,16 +38,37 @@ public class PaymentService {
   private final PaymentRepository payments;
   private final WebhookDeliveryRepository deliveries;
   private final ObjectMapper objectMapper;
+  private final ExecutorService executor;
+  private final ScheduledExecutorService scheduler;
+  private final AntiFraudChecker antiFraudChecker;
+  private final java.util.Map<String, edu.ucsal.fiadopay.payment.PaymentHandler> handlers;
+  private final WebhookDeliveryCircuitCircuitBreaker circuitBreaker;
+  private final edu.ucsal.fiadopay.service.DeliveryMetrics deliveryMetrics;
 
   @Value("${fiadopay.webhook-secret}") String secret;
   @Value("${fiadopay.processing-delay-ms}") long delay;
   @Value("${fiadopay.failure-rate}") double failRate;
 
-  public PaymentService(MerchantRepository merchants, PaymentRepository payments, WebhookDeliveryRepository deliveries, ObjectMapper objectMapper) {
+  public PaymentService(MerchantRepository merchants,
+                        PaymentRepository payments,
+                        WebhookDeliveryRepository deliveries,
+                        ObjectMapper objectMapper,
+                        AntiFraudChecker antiFraudChecker,
+                        ExecutorService fiadoExecutor,
+                        ScheduledExecutorService fiadoScheduler,
+                        java.util.Map<String, edu.ucsal.fiadopay.payment.PaymentHandler> handlers,
+                        WebhookDeliveryCircuitCircuitBreaker circuitBreaker,
+                        edu.ucsal.fiadopay.service.DeliveryMetrics deliveryMetrics) {
     this.merchants = merchants;
     this.payments = payments;
     this.deliveries = deliveries;
     this.objectMapper = objectMapper;
+    this.antiFraudChecker = antiFraudChecker;
+    this.executor = fiadoExecutor;
+    this.scheduler = fiadoScheduler;
+    this.handlers = handlers;
+    this.circuitBreaker = circuitBreaker;
+    this.deliveryMetrics = deliveryMetrics;
   }
 
   private Merchant merchantFromAuth(String auth){
@@ -64,33 +90,30 @@ public class PaymentService {
   }
 
   @Transactional
+  @AntiFraud(name = "HighAmount", threshold = 1000.0)
   public PaymentResponse createPayment(String auth, String idemKey, PaymentRequest req){
     var merchant = merchantFromAuth(auth);
     var mid = merchant.getId();
+
+    // Anti-fraud quick check based on annotation-configured threshold
+    antiFraudChecker.check(req);
 
     if (idemKey != null) {
       var existing = payments.findByIdempotencyKeyAndMerchantId(idemKey, mid);
       if(existing.isPresent()) return toResponse(existing.get());
     }
 
-    Double interest = null;
     BigDecimal total = req.amount();
-    if ("CARD".equalsIgnoreCase(req.method()) && req.installments()!=null && req.installments()>1){
-      interest = 1.0; // 1%/mês
-      var base = new BigDecimal("1.01");
-      var factor = base.pow(req.installments());
-      total = req.amount().multiply(factor).setScale(2, RoundingMode.HALF_UP);
-    }
-
+    // create payment skeleton and let handler adjust fields if present
     var payment = Payment.builder()
         .id("pay_"+UUID.randomUUID().toString().substring(0,8))
         .merchantId(mid)
-        .method(req.method().toUpperCase())
+        .method(req.method()==null?"":req.method().toUpperCase())
         .amount(req.amount())
         .currency(req.currency())
         .installments(req.installments()==null?1:req.installments())
-        .monthlyInterest(interest)
-        .totalWithInterest(total)
+        .monthlyInterest(null)
+        .totalWithInterest(req.amount())
         .status(Payment.Status.PENDING)
         .createdAt(Instant.now())
         .updatedAt(Instant.now())
@@ -98,9 +121,23 @@ public class PaymentService {
         .metadataOrderId(req.metadataOrderId())
         .build();
 
+    // delegate to a payment method handler if available
+    var method = req.method()==null?"":req.method().toUpperCase();
+    var handlerBean = handlers.values().stream().filter(h -> method.equalsIgnoreCase(h.type())).findFirst().orElse(null);
+    if (handlerBean!=null) {
+      handlerBean.apply(payment, req);
+    } else {
+      if ("CARD".equalsIgnoreCase(req.method()) && req.installments()!=null && req.installments()>1){
+        var base = new BigDecimal("1.01");
+        var factor = base.pow(req.installments());
+        payment.setTotalWithInterest(req.amount().multiply(factor).setScale(2, RoundingMode.HALF_UP));
+        payment.setMonthlyInterest(1.0);
+      }
+    }
+
     payments.save(payment);
 
-    CompletableFuture.runAsync(() -> processAndWebhook(payment.getId()));
+    executor.submit(() -> processAndWebhook(payment.getId()));
 
     return toResponse(payment);
   }
@@ -173,13 +210,23 @@ public class PaymentService {
         .lastAttemptAt(null)
         .build());
 
-    CompletableFuture.runAsync(() -> tryDeliver(delivery.getId()));
+    executor.submit(() -> tryDeliver(delivery.getId()));
   }
 
   private void tryDeliver(Long deliveryId){
     var d = deliveries.findById(deliveryId).orElse(null);
     if (d==null) return;
+    var target = d.getTargetUrl();
+
+    // circuit-breaker: if tripped, schedule next attempt after cooldown
+    if (!circuitBreaker.allowRequest(target)){
+      long cooldown = circuitBreaker.getCooldownMs(target);
+      scheduler.schedule(() -> tryDeliver(deliveryId), cooldown>0?cooldown:1000L, TimeUnit.MILLISECONDS);
+      return;
+    }
+
     try {
+      deliveryMetrics.incAttempt();
       var client = HttpClient.newHttpClient();
       var req = HttpRequest.newBuilder(URI.create(d.getTargetUrl()))
         .header("Content-Type","application/json")
@@ -192,20 +239,29 @@ public class PaymentService {
       d.setLastAttemptAt(Instant.now());
       d.setDelivered(res.statusCode()>=200 && res.statusCode()<300);
       deliveries.save(d);
+
+      if (d.isDelivered()){
+        circuitBreaker.recordSuccess(target);
+        deliveryMetrics.incSuccess();
+      } else {
+        circuitBreaker.recordFailure(target);
+        deliveryMetrics.incFailure();
+      }
+
       if(!d.isDelivered() && d.getAttempts()<5){
-        Thread.sleep(1000L * d.getAttempts());
-        tryDeliver(deliveryId);
+        long backoff = (long) Math.pow(2, d.getAttempts()) * 1000L; // exponential backoff
+        scheduler.schedule(() -> tryDeliver(deliveryId), backoff, TimeUnit.MILLISECONDS);
       }
     } catch (Exception e){
       d.setAttempts(d.getAttempts()+1);
       d.setLastAttemptAt(Instant.now());
       d.setDelivered(false);
       deliveries.save(d);
+      circuitBreaker.recordFailure(target);
+      deliveryMetrics.incFailure();
       if (d.getAttempts()<5){
-        try {
-          Thread.sleep(1000L * d.getAttempts());
-        } catch (InterruptedException ignored) {}
-        tryDeliver(deliveryId);
+        long backoff = (long) Math.pow(2, d.getAttempts()) * 1000L;
+        scheduler.schedule(() -> tryDeliver(deliveryId), backoff, TimeUnit.MILLISECONDS);
       }
     }
   }
